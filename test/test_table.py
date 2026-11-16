@@ -321,6 +321,125 @@ def test_update_many(db):
     assert tbl.find_one(id=1)["temp"] == tbl.find_one(id=3)["temp"]
 
 
+def test_update_many_missing_fields_are_unchanged(db):
+    tbl = db["update_many_missing_fields"]
+    tbl.insert_many(
+        [
+            {"id": 1, "amount": 10, "note": "A"},
+            {"id": 2, "amount": 20, "note": "B"},
+        ]
+    )
+    rows = [{"id": 1, "amount": 11}, {"id": 2, "note": "B2"}]
+    for chunk_size in (1, 2, 1000):
+        tbl.update_many(rows, "id", chunk_size=chunk_size)
+        assert tbl.find_one(id=1) == {"id": 1, "amount": 11, "note": "A"}
+        assert tbl.find_one(id=2) == {"id": 2, "amount": 20, "note": "B2"}
+        tbl.update({"id": 1, "amount": 10, "note": "A"}, "id")
+        tbl.update({"id": 2, "amount": 20, "note": "B"}, "id")
+
+
+def test_update_many_explicit_null_clears_and_repeats_apply_in_order(db):
+    tbl = db["update_many_order"]
+    tbl.insert_many(
+        [
+            {"id": 1, "amount": 10, "note": "A", "extra": "x"},
+            {"id": 2, "amount": 20, "note": "B", "extra": "y"},
+        ]
+    )
+    tbl.update_many(
+        [
+            {"id": 1, "amount": 100},
+            {"id": 1, "note": None},
+            {"id": 1, "amount": 101},
+            {"id": 2, "extra": "y2"},
+            {"id": 2, "amount": 21},
+        ],
+        "id",
+        chunk_size=2,
+    )
+    assert tbl.find_one(id=1) == {"id": 1, "amount": 101, "note": None, "extra": "x"}
+    assert tbl.find_one(id=2) == {"id": 2, "amount": 21, "note": "B", "extra": "y2"}
+
+
+def test_update_many_matches_update_for_case_and_schema(db):
+    tbl = db["update_many_case"]
+    tbl.insert({"id": 1, "amount": 5, "code": None})
+    tbl.update_many(
+        [{"ID": 1, "Amount": 6, "CODE": None, "Note": "n"}],
+        ["ID"],
+        ensure=True,
+        types={"Note": db.types.text},
+    )
+    assert tbl.find_one(id=1) == {
+        "id": 1,
+        "amount": 6,
+        "code": None,
+        "Note": "n",
+    }
+    # New columns are created with the caller's spelling, like update().
+    assert ("Note", TEXT().compile(), True, False) in [
+        (c.name, c.type.compile(), c.nullable, c.primary_key) for c in tbl.table.columns
+    ]
+
+
+def test_update_many_null_and_internal_looking_columns(db):
+    tbl = db["update_many_binds"]
+    tbl.create_column("code", db.types.text)
+    tbl.insert_many(
+        [
+            {"id": 1, "code": None, "_id": "u1", "__dataset_bind_0": "old"},
+            {"id": 2, "code": "k", "_id": "u1", "__dataset_bind_0": "old"},
+            {"id": 3, "code": None, "_id": "u1", "__dataset_bind_0": "old"},
+        ]
+    )
+    tbl.update_many(
+        [
+            {"id": 1, "code": None, "_id": "u2", "__dataset_bind_0": "new"},
+            {"id": 2, "code": "k", "_id": "u2"},
+            {"id": 3, "code": None},
+        ],
+        ["id"],
+        ensure=False,
+    )
+    assert tbl.find_one(id=1) == {
+        "id": 1,
+        "code": None,
+        "_id": "u2",
+        "__dataset_bind_0": "new",
+    }
+    assert tbl.find_one(id=2) == {
+        "id": 2,
+        "code": "k",
+        "_id": "u2",
+        "__dataset_bind_0": "old",
+    }
+    assert tbl.find_one(id=3)["_id"] == "u1"
+
+
+def test_update_many_does_not_mutate_inputs_and_empty_batch(db):
+    tbl = db["update_many_inputs"]
+    tbl.insert_many([{"id": 1, "amount": 10}, {"id": 2, "amount": 20}])
+    rows = [{"id": 1, "amount": 11}, {"id": 2, "amount": 21}]
+    keys = ["id"]
+    tbl.update_many(rows, keys, chunk_size=1)
+    assert rows == [{"id": 1, "amount": 11}, {"id": 2, "amount": 21}]
+    assert keys == ["id"]
+    tbl.update_many([], keys)
+    assert len(tbl) == 2
+
+
+def test_update_many_respects_explicit_transaction(db):
+    tbl = db["update_many_tx"]
+    tbl.insert({"id": 1, "amount": 10})
+    db.begin()
+    tbl.update_many([{"id": 1, "amount": 20}], "id")
+    db.rollback()
+    assert tbl.find_one(id=1)["amount"] == 10
+    with db:
+        tbl.update_many([{"id": 1, "amount": 30}], "id")
+    assert tbl.find_one(id=1)["amount"] == 30
+
+
 def test_chunked_update(db):
     tbl = db["update_many_test"]
     tbl.insert_many(
@@ -403,9 +522,7 @@ def test_update(table):
     )
     assert res, "update should return True"
     m = table.find_one(place=TEST_CITY_1, date=date)
-    assert m["temperature"] == -10, (
-        f"new temp. should be -10 but is {m['temperature']}"
-    )
+    assert m["temperature"] == -10, f"new temp. should be -10 but is {m['temperature']}"
 
 
 def test_create_column(db, table):

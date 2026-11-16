@@ -289,36 +289,122 @@ class Table:
         the rows are processed in chunks of 1000 per commit, unless you specify
         a different ``chunk_size``.
 
+        Each row has the same meaning as a single :py:meth:`update()
+        <dataset.Table.update>` call made in input order: columns missing from
+        a row are left untouched, while columns explicitly set to ``None`` are
+        cleared. Consecutive rows that update the same set of columns are
+        executed together as one batched statement.
+
         See :py:meth:`update() <dataset.Table.update>` for details on
         the other parameters.
         """
         keys = ensure_strings(keys)
+        if not rows:
+            return
 
-        chunk: list[MutableRow] = []
-        columns: list[str] = []
-        for index, row in enumerate(rows):
-            columns.extend(
-                col for col in row if (col not in columns) and (col not in keys)
-            )
+        chunk_size = max(1, chunk_size)
+        # A group is a run of consecutive rows with an identical update
+        # structure: same key columns (with the same NULL-ness) and the same
+        # set of columns to write.
+        group: list[tuple[MutableRow, MutableRow]] = []
+        signature: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]] | None = (
+            None
+        )
 
-            # bindparam requires names to not conflict (cannot be "id" for id)
-            row_ = dict(row)
-            for key in keys:
-                row_[f"_{key}"] = row_[key]
-                row_.pop(key)
-            chunk.append(row_)
-
-            # Update when chunk_size is fulfilled or this is the last row
-            if len(chunk) == chunk_size or index == len(rows) - 1:
-                cl = [self.table.c[k] == bindparam(f"_{k}") for k in keys]
-                stmt = (
-                    self.table.update()
-                    .where(and_(True, *cl))
-                    .values({col: bindparam(col, required=False) for col in columns})
-                )
-                self.db.executable.execute(stmt, chunk)
+        def flush() -> None:
+            nonlocal group, signature
+            if group:
+                self._update_many_group(group)
                 self.db._auto_commit()
-                chunk = []
+                group = []
+            signature = None
+
+        for row in rows:
+            # Use the same column-name resolution and schema synchronization as
+            # a single-row update.
+            row_ = self._sync_columns(row, ensure, types=types)
+            args, values = self._keys_to_args(row_, keys)
+
+            # Non-scalar key values would be interpreted as query operators by
+            # update(); fall back to a single-row call to keep identical
+            # semantics.
+            if any(isinstance(v, (list, tuple, set, dict)) for v in args.values()):
+                flush()
+                self.update(row, keys, ensure=ensure, types=types)
+                continue
+
+            # Rows without an update payload only perform a count in update().
+            if not values:
+                continue
+
+            args_sig = tuple(args)
+            values_sig = tuple(sorted(values))
+            null_sig = tuple(k for k, v in args.items() if v is None)
+            row_sig = (args_sig, values_sig, null_sig)
+            if signature is not None and row_sig != signature:
+                flush()
+            signature = row_sig
+            group.append((args, values))
+            if len(group) >= chunk_size:
+                flush()
+
+        flush()
+
+    def _update_many_group(
+        self, group: Sequence[tuple[MutableRow, MutableRow]]
+    ) -> None:
+        """Execute a run of rows with an identical update structure."""
+        args, values = group[0]
+        columns = list(values)
+
+        if not all(self.has_column(key) for key in args):
+            # update() renders a false() clause for unknown key columns; the
+            # statement cannot affect any record.
+            return
+
+        # Pick bind parameter names which cannot collide with real column names
+        # (SQLAlchemy reserves those in UPDATE statements) or with each other.
+        reserved = {
+            normalize_column_key(name)
+            for name in [*self.table.c.keys(), *columns, *args]
+        }
+        key_binds: dict[str, str] = {}
+        counter = 0
+        for key, value in args.items():
+            if value is None:
+                continue
+            name = f"__dataset_bind_{counter}"
+            while normalize_column_key(name) in reserved:
+                counter += 1
+                name = f"__dataset_bind_{counter}"
+            reserved.add(normalize_column_key(name))
+            key_binds[key] = name
+            counter += 1
+
+        clauses: list[ColumnElement[bool]] = []
+        for key, value in args.items():
+            column = self.table.c[key]
+            if value is None:
+                clauses.append(column.is_(None))
+            else:
+                clauses.append(column == bindparam(key_binds[key]))
+
+        stmt = (
+            self.table.update()
+            .where(and_(True, *clauses))
+            .values({col: bindparam(col) for col in columns})
+        )
+        params: list[MutableRow] = []
+        for row_args, row_values in group:
+            param: MutableRow = {
+                key_binds[key]: value
+                for key, value in row_args.items()
+                if key in key_binds
+            }
+            for col in columns:
+                param[col] = row_values[col]
+            params.append(param)
+        self.db.executable.execute(stmt, params)
 
     def upsert(
         self,
@@ -579,7 +665,10 @@ class Table:
         return args, row_
 
     def create_column(
-        self, name: str, type: ColumnType, **kwargs: object  # noqa: A002
+        self,
+        name: str,
+        type: ColumnType,
+        **kwargs: object,  # noqa: A002
     ) -> None:
         """Create a new column ``name`` of a specified type.
         ::
