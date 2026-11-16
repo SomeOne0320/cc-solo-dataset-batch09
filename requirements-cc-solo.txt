@@ -12,6 +12,6 @@ pathspec==1.1.1
 pluggy==1.7.0
 pytest==7.4.4
 ruff==0.14.4
-SQLAlchemy==2.0.44
+SQLAlchemy==2.0.57
 trove-classifiers==2026.9.21.13
 typing_extensions==4.16.0
