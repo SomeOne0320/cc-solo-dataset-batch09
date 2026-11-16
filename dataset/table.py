@@ -8,7 +8,7 @@ from sqlalchemy import false, func, select
 from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.schema import Column, Index
 from sqlalchemy.schema import Table as SQLATable
-from sqlalchemy.sql import and_, expression
+from sqlalchemy.sql import and_, expression, union_all
 from sqlalchemy.sql.expression import (
     ClauseElement,
     ColumnElement,
@@ -356,13 +356,264 @@ class Table:
         Sorts multiple input rows into upserts and inserts. Inserts are passed
         to insert and upserts are updated.
 
+        Rows are processed in chunks of ``chunk_size``. Within each chunk,
+        rows sharing the same key are coalesced in input order and the
+        existence of the keys is established with a single query over just
+        the keys in that chunk. Existing keys are updated in grouped
+        statements and new keys are inserted in grouped statements, rather
+        than issuing a SELECT and write for every row.
+
         See :py:meth:`upsert() <dataset.Table.upsert>` and
         :py:meth:`insert_many() <dataset.Table.insert_many>`.
         """
-        # Removing a bulk implementation in 5e09aba401. Doing this one by one
-        # is incredibly slow, but doesn't run into issues with column creation.
+        row_list = list(rows)
+        if not row_list:
+            return
+        key_names = ensure_strings(keys)
+
+        # Create every column used by these rows before any write, matching
+        # the first-seen sample and type hints used by per-row writes. Keys
+        # are deduplicated the same way ``_get_column_name`` resolves them, so
+        # differently-cased spellings of a new column create it only once.
+        sync_row: MutableRow = {}
+        sync_keys: set[str] = set()
+        for row in row_list:
+            for name, value in row.items():
+                key = normalize_column_key(normalize_column_name(name))
+                assert key is not None
+                if key not in sync_keys:
+                    sync_keys.add(key)
+                    sync_row[name] = value
+        self._sync_columns(sync_row, ensure, types=types)
+
+        if self._check_ensure(ensure):
+            self.create_index(key_names)
+
+        chunk_size = max(1, chunk_size)
+        for start in range(0, len(row_list), chunk_size):
+            chunk = row_list[start : start + chunk_size]
+            self._upsert_many_chunk(chunk, key_names, types)
+
+    # Maximum number of key tuples to include in one compound SELECT. SQLite
+    # limits compound SELECTs to 500 terms by default, and older SQLite builds
+    # limit a statement to 999 bound parameters (one index plus one per key
+    # column for each term).
+    _UPSERT_MAX_KEY_TERMS = 400
+    _UPSERT_MAX_KEY_PARAMS = 900
+
+    def _upsert_key_batch_size(self, key_count: int) -> int:
+        # Each term binds the row index plus one value per key column.
+        per_term = key_count + 2
+        return max(
+            1, min(self._UPSERT_MAX_KEY_TERMS, self._UPSERT_MAX_KEY_PARAMS // per_term)
+        )
+
+    def _upsert_many_chunk(
+        self,
+        rows: Sequence[WriteRow],
+        keys: Sequence[str],
+        types: dict[str, ColumnType] | None,
+    ) -> None:
+        """Process one chunk of :py:meth:`upsert_many` as a group."""
+        key_columns = [self._get_column_name(k) for k in keys]
+        if (
+            not key_columns
+            or len(set(key_columns)) != len(key_columns)
+            or not all(self.has_column(column) for column in key_columns)
+        ):
+            # Without key columns every row would fall through to an insert,
+            # exactly as in the per-row implementation.
+            for row in rows:
+                self.upsert(row, keys, ensure=False)
+            return
+
+        batch: list[MutableRow] = []
         for row in rows:
-            self.upsert(row, keys, ensure=ensure, types=types)
+            synced = self._sync_columns(row, ensure=False, types=types)
+            if self._is_upsert_batchable(synced, key_columns):
+                batch.append(synced)
+            else:
+                # NULL keys, in-row operator values and rows missing a key
+                # must keep the exact per-row semantics, including whether an
+                # insert generates a non-NULL key. Flush the surrounding batch
+                # and process this row on its own, preserving input order.
+                self._upsert_many_batch(batch, key_columns)
+                batch = []
+                self.upsert(synced, keys, ensure=False)
+        self._upsert_many_batch(batch, key_columns)
+
+    @staticmethod
+    def _is_upsert_batchable(row: MutableRow, key_columns: Sequence[str]) -> bool:
+        for column in key_columns:
+            if column not in row:
+                return False
+            value = row[column]
+            if value is None or isinstance(value, (list, tuple, set, dict)):
+                return False
+        return True
+
+    def _upsert_many_batch(
+        self, rows: Sequence[MutableRow], key_columns: Sequence[str]
+    ) -> None:
+        """Coalesce and write a set of rows whose keys are all non-NULL."""
+        if not rows:
+            return
+
+        order: list[tuple[SQLWriteValue, ...]] = []
+        payloads: dict[tuple[SQLWriteValue, ...], MutableRow] = {}
+        for row in rows:
+            key = tuple(row[column] for column in key_columns)
+            payload = payloads.get(key)
+            if payload is None:
+                payload = {}
+                payloads[key] = payload
+                order.append(key)
+            for name, value in row.items():
+                if name not in key_columns:
+                    payload[name] = value
+
+        existing = self._existing_upsert_keys(key_columns, order)
+
+        updates: dict[
+            tuple[str, ...], list[tuple[tuple[SQLWriteValue, ...], MutableRow]]
+        ] = {}
+        insert_order: list[tuple[tuple[str, ...], MutableRow]] = []
+        for index, key in enumerate(order):
+            payload = payloads[key]
+            if index in existing:
+                # An update with no non-key fields only checks for a match.
+                if payload:
+                    fields = tuple(payload.keys())
+                    updates.setdefault(fields, []).append((key, payload))
+            else:
+                full = dict(zip(key_columns, key, strict=True))
+                full.update(payload)
+                insert_order.append((tuple(full.keys()), full))
+
+        self._execute_upsert_updates(key_columns, updates)
+        self._execute_upsert_inserts(insert_order)
+
+    def _existing_upsert_keys(
+        self,
+        key_columns: Sequence[str],
+        keys: Sequence[tuple[SQLWriteValue, ...]],
+    ) -> set[int]:
+        """Return indices of key tuples that already have a matching row.
+
+        Only the keys supplied by the caller are queried; the table is not
+        loaded into memory.
+        """
+        existing: set[int] = set()
+        batch_size = self._upsert_key_batch_size(len(key_columns))
+        for start in range(0, len(keys), batch_size):
+            batch = keys[start : start + batch_size]
+            parts: list[Any] = []
+            for offset, key in enumerate(batch):
+                columns: list[Any] = [
+                    expression.literal(start + offset).label("__dataset_upsert_idx")
+                ]
+                for position, (column, value) in enumerate(
+                    zip(key_columns, key, strict=True)
+                ):
+                    columns.append(
+                        bindparam(
+                            f"__dataset_upsert_key_{offset}_{position}",
+                            value=value,
+                            type_=self.table.c[column].type,
+                        ).label(f"__dataset_upsert_key_{position}")
+                    )
+                parts.append(select(*columns))
+
+            derived = union_all(*parts).subquery()
+            condition = and_(
+                True,
+                *[
+                    self.table.c[column].is_not_distinct_from(
+                        derived.c[f"__dataset_upsert_key_{position}"]
+                    )
+                    for position, column in enumerate(key_columns)
+                ],
+            )
+            stmt = select(derived.c["__dataset_upsert_idx"]).select_from(
+                derived.join(self.table, condition)
+            )
+            for result in self.db.executable.execute(stmt):
+                existing.add(int(result[0]))
+        return existing
+
+    def _execute_upsert_updates(
+        self,
+        key_columns: Sequence[str],
+        updates: dict[
+            tuple[str, ...], list[tuple[tuple[SQLWriteValue, ...], MutableRow]]
+        ],
+    ) -> None:
+        key_binds = [f"__dataset_upsert_key_{i}" for i in range(len(key_columns))]
+        for fields, entries in updates.items():
+            clause = and_(
+                True,
+                *[
+                    self.table.c[column] == bindparam(bind)
+                    for column, bind in zip(key_columns, key_binds, strict=True)
+                ],
+            )
+            value_binds = [f"__dataset_upsert_value_{i}" for i in range(len(fields))]
+            values: dict[str, Any] = {
+                column: bindparam(bind)
+                for column, bind in zip(fields, value_binds, strict=True)
+            }
+            stmt = self.table.update().where(clause).values(values)
+            params: list[MutableRow] = []
+            for key, payload in entries:
+                row: MutableRow = dict(zip(key_binds, key, strict=True))
+                row.update(
+                    {
+                        bind: payload[column]
+                        for column, bind in zip(fields, value_binds, strict=True)
+                    }
+                )
+                params.append(row)
+            self.db.executable.execute(stmt, params)
+            self.db._auto_commit()
+
+    def _execute_upsert_inserts(
+        self,
+        inserts: Sequence[tuple[tuple[str, ...], MutableRow]],
+    ) -> None:
+        # Group consecutive rows with the same field set so one statement can
+        # carry an executemany batch, without reordering inserts relative to
+        # each other (this keeps auto-increment key assignment in input order).
+        pending: list[tuple[tuple[str, ...], MutableRow]] = []
+        pending_fields: tuple[str, ...] | None = None
+        for fields, row in inserts:
+            if pending and fields != pending_fields:
+                assert pending_fields is not None
+                self._execute_upsert_insert_group(pending, pending_fields)
+                pending = []
+            if not pending:
+                pending_fields = fields
+            pending.append((fields, row))
+        if pending and pending_fields is not None:
+            self._execute_upsert_insert_group(pending, pending_fields)
+
+    def _execute_upsert_insert_group(
+        self,
+        inserts: Sequence[tuple[tuple[str, ...], MutableRow]],
+        fields: Sequence[str],
+    ) -> None:
+        binds = [f"__dataset_upsert_insert_{i}" for i in range(len(fields))]
+        stmt = self.table.insert().values(
+            {
+                column: bindparam(bind)
+                for column, bind in zip(fields, binds, strict=True)
+            }
+        )
+        params: list[MutableRow] = [
+            {bind: row[column] for column, bind in zip(fields, binds, strict=True)}
+            for _unused, row in inserts
+        ]
+        self.db.executable.execute(stmt, params)
+        self.db._auto_commit()
 
     def delete(self, *clauses: ColumnElement[bool], **filters: SQLWriteValue) -> bool:
         """Delete rows from the table.

@@ -1,6 +1,7 @@
 from datetime import datetime
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.types import BIGINT, TEXT
 
@@ -354,6 +355,211 @@ def test_upsert_many(db):
     assert tbl.find_one(id=2)["weight"] == weight / 2
 
 
+def _count_statements(db, callback):
+    """Run ``callback`` and return the SQL statements it executed."""
+    statements = []
+
+    def before_cursor_execute(
+        conn, cursor, statement, parameters, context, executemany
+    ):
+        statements.append(statement.strip().split()[0])
+
+    event.listen(db.engine, "before_cursor_execute", before_cursor_execute)
+    try:
+        callback()
+    finally:
+        event.remove(db.engine, "before_cursor_execute", before_cursor_execute)
+    return statements
+
+
+def _upsert_many_reference(tbl, rows, keys, ensure=None, types=None):
+    """The original per-row implementation, used as the semantic reference."""
+    for row in rows:
+        tbl.upsert(row, keys, ensure=ensure, types=types)
+
+
+@pytest.mark.parametrize(
+    "seed,rows,keys",
+    [
+        # A mixed batch: half already present, half new.
+        (
+            [{"cid": i, "name": f"old{i}", "city": f"c{i}"} for i in range(10)],
+            [{"cid": i, "name": f"new{i}"} for i in range(20)],
+            ["cid"],
+        ),
+        # Repeated keys inside one batch, each occurrence carrying a subset.
+        (
+            [{"cid": 1, "name": "seed", "city": "seed"}],
+            [
+                {"cid": 1, "name": "a"},
+                {"cid": 2, "city": "x"},
+                {"cid": 1, "city": "y"},
+                {"cid": 2, "name": "b"},
+                {"cid": 3, "name": "c"},
+                {"cid": 3, "name": "d"},
+            ],
+            ["cid"],
+        ),
+        # Composite keys.
+        (
+            [{"a": 1, "b": 1, "v": "s1"}],
+            [
+                {"a": 1, "b": 1, "v": "u1"},
+                {"a": 1, "b": 2, "w": "u2"},
+                {"a": 2, "b": 1, "v": "n1"},
+            ],
+            ["a", "b"],
+        ),
+        # NULL keys keep per-row semantics.
+        (
+            [{"k": "a", "v": 1}],
+            [{"k": None, "v": 2}, {"k": "b", "v": 3}, {"k": None, "v": 4}],
+            ["k"],
+        ),
+        # Rows missing the key column entirely.
+        (
+            [{"k": "a", "v": 1}],
+            [{"v": 10}, {"k": "a", "v": 2}, {"v": 11}],
+            ["k"],
+        ),
+        # All fields are keys.
+        (
+            [{"a": 1, "b": 2}],
+            [{"a": 1, "b": 2}, {"a": 3, "b": 4}],
+            ["a", "b"],
+        ),
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [1, 2, 1000])
+def test_upsert_many_matches_row_by_row(db, seed, rows, keys, chunk_size):
+    new = db["upsert_many_new"]
+    new.insert_many(seed)
+    reference = db["upsert_many_reference"]
+    reference.insert_many(seed)
+
+    new.upsert_many(rows, keys, chunk_size=chunk_size)
+    _upsert_many_reference(reference, rows, keys)
+    assert [dict(r) for r in new.find(order_by=["id"])] == [
+        dict(r) for r in reference.find(order_by=["id"])
+    ]
+    assert [(c.name, str(c.type)) for c in new.table.columns] == [
+        (c.name, str(c.type)) for c in reference.table.columns
+    ]
+
+
+def test_upsert_many_does_not_clear_partial_fields(db):
+    tbl = db["upsert_many_partial"]
+    tbl.insert({"cid": 1, "name": "old", "city": "Berlin"})
+
+    tbl.upsert_many([{"cid": 1, "name": "new"}], ["cid"])
+    assert tbl.find_one(cid=1)["name"] == "new"
+    assert tbl.find_one(cid=1)["city"] == "Berlin"
+
+    # A later batch must not resurrect the pre-batch value.
+    tbl.upsert_many([{"cid": 1, "city": "Paris"}], ["cid"])
+    row = tbl.find_one(cid=1)
+    assert row["name"] == "new"
+    assert row["city"] == "Paris"
+
+
+def test_upsert_many_updates_all_rows_sharing_key(db):
+    # The original table may contain several rows with the same key value;
+    # all of them must be updated, as the per-row implementation did.
+    tbl = db["upsert_many_dup_rows"]
+    tbl.insert_many([{"cid": 1, "name": "a"}, {"cid": 1, "name": "b"}])
+    tbl.upsert_many([{"cid": 1, "name": "c"}], ["cid"])
+    assert [r["name"] for r in tbl.find(order_by=["id"])] == ["c", "c"]
+
+
+def test_upsert_many_case_and_new_columns(db):
+    tbl = db["upsert_many_case"]
+    tbl.insert({"Name": "old"})
+    rows = [
+        {"CID": 1, "NAME": "one", "Extra": 1},
+        {"cid": 2, "name": "two", "extra": 2},
+    ]
+    types = {"Extra": db.types.float}
+    tbl.upsert_many(rows, ["cid"], types=types)
+    reference = db["upsert_many_case_ref"]
+    reference.insert({"Name": "old"})
+    _upsert_many_reference(reference, rows, ["cid"], types=types)
+    assert [dict(r) for r in tbl.find(order_by=["id"])] == [
+        dict(r) for r in reference.find(order_by=["id"])
+    ]
+    assert [(c.name, str(c.type)) for c in tbl.table.columns] == [
+        (c.name, str(c.type)) for c in reference.table.columns
+    ]
+
+
+def test_upsert_many_does_not_mutate_input(db):
+    tbl = db["upsert_many_input"]
+    rows = [{"cid": 1, "name": "a"}, {"cid": 2, "name": "b"}]
+    original = [dict(row) for row in rows]
+    keys = ["cid"]
+    original_keys = list(keys)
+    tbl.upsert_many(rows, keys)
+    assert rows == original
+    assert keys == original_keys
+
+
+def test_upsert_many_reduces_statements(db):
+    tbl = db["upsert_many_statements"]
+    tbl.insert_many([{"cid": i, "name": f"old{i}"} for i in range(20)])
+    rows = [{"cid": i, "name": f"new{i}"} for i in range(40)]
+
+    statements = _count_statements(
+        db, lambda: tbl.upsert_many(rows, ["cid"], chunk_size=1000)
+    )
+    dml = [s for s in statements if s in ("INSERT", "UPDATE")]
+    selects = [s for s in statements if s == "SELECT"]
+    # One key-existence query plus one grouped UPDATE and one grouped INSERT.
+    assert len(dml) == 2, statements
+    assert len(selects) == 1, statements
+    assert len(tbl) == 40
+
+
+def test_upsert_many_chunk_size_drives_grouping(db):
+    tbl = db["upsert_many_chunks"]
+    tbl.insert_many([{"cid": i, "name": f"old{i}"} for i in range(10)])
+    rows = [{"cid": i, "name": f"new{i}"} for i in range(20)]
+
+    grouped = _count_statements(
+        db, lambda: tbl.upsert_many(rows, ["cid"], chunk_size=1000)
+    )
+    per_row = _count_statements(
+        db, lambda: tbl.upsert_many(rows, ["cid"], chunk_size=1)
+    )
+    assert len(per_row) > len(grouped)
+    assert len([s for s in per_row if s == "SELECT"]) == 20
+
+
+def test_upsert_many_does_not_load_history(db):
+    tbl = db["upsert_many_nohistory"]
+    tbl.insert_many([{"cid": i, "name": f"old{i}"} for i in range(500)])
+
+    statements = _count_statements(
+        db, lambda: tbl.upsert_many([{"cid": 1, "name": "new"}], ["cid"])
+    )
+    selects = [s for s in statements if s == "SELECT"]
+    assert len(selects) == 1
+
+
+def test_upsert_many_respects_explicit_transaction(db):
+    tbl = db["upsert_many_tx"]
+    tbl.insert({"cid": 1, "name": "old"})
+
+    with pytest.raises(RuntimeError), db:
+        tbl.upsert_many([{"cid": 1, "name": "new"}, {"cid": 2, "name": "new"}], ["cid"])
+        raise RuntimeError()
+
+    assert len(tbl) == 1
+    assert tbl.find_one(cid=1)["name"] == "old"
+
+    with db:
+        tbl.upsert_many([{"cid": 1, "name": "new"}], ["cid"])
+    assert tbl.find_one(cid=1)["name"] == "new"
+
+
 def test_drop_operations(table):
     assert table._table is not None, "table shouldn't be dropped yet"
     table.drop()
@@ -403,9 +609,7 @@ def test_update(table):
     )
     assert res, "update should return True"
     m = table.find_one(place=TEST_CITY_1, date=date)
-    assert m["temperature"] == -10, (
-        f"new temp. should be -10 but is {m['temperature']}"
-    )
+    assert m["temperature"] == -10, f"new temp. should be -10 but is {m['temperature']}"
 
 
 def test_create_column(db, table):
