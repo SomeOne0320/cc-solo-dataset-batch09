@@ -95,6 +95,41 @@ Nested transactions are supported too::
         with db as tx2:
             tx2['user'].insert(dict(name='Jane Doe', age=37, country='France', gender='female'))
 
+Note that such plain nested blocks only track the nesting depth: if an inner
+block is rolled back while the outer transaction continues, the changes made
+inside the inner block are *not* undone.
+
+Independent inner transactions
+------------------------------
+
+When a batch is processed inside one big transaction, a single failing item
+should not have to abort the whole batch. :py:meth:`db.transaction()
+<dataset.Database.transaction>` returns a transaction context manager with an
+optional ``savepoint`` switch. Called without arguments it behaves exactly
+like ``with db:``. With ``savepoint=True`` inside an already active
+transaction, the block becomes an independent inner transaction: when it
+raises, only the changes made inside the block are withdrawn, and the outer
+transaction can catch the exception, keep writing and still commit::
+
+    db = dataset.connect()
+    with db:  # outer transaction
+        for order in orders:
+            try:
+                with db.transaction(savepoint=True):
+                    db['orders'].insert(order)
+                    validate(order)
+            except ValueError:
+                # only this order is withdrawn, the batch continues
+                continue
+
+When a savepoint block ends normally, its changes are confirmed for that
+layer only — a later rollback of the outer transaction still discards them.
+If no transaction is active, ``db.transaction(savepoint=True)`` behaves like
+a regular transaction and commits only when the block ends normally.
+
+Transaction state is tracked per thread, and leaving an inner block never
+releases the connection that the outer transaction is still using.
+
 Closing connections
 -------------------
 

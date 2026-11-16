@@ -3,6 +3,10 @@
 *The changelog has only been started with version 0.3.12, previous
 changes must be reconstructed from revision history.*
 
+* **Unreleased**
+  - **`Database.transaction()`**: New transaction context manager with an optional `savepoint=True` switch. Inside an active transaction it creates an independent inner transaction (SAVEPOINT): exceptions roll back only that layer while the outer transaction can continue and commit. Without an active transaction it behaves like a regular transaction. Called without arguments it matches the existing `with db:` semantics.
+  - **Rollback metadata**: Transaction rollbacks now also clear cached column and index information, so table objects reflect the actual database structure after rolled-back schema changes.
+
 * **2.0.0**: Major modernization and type annotations
   - **Type annotations**: Full `mypy --strict` compliance across all modules
   - **PEP 561**: Added `py.typed` marker for downstream type checking

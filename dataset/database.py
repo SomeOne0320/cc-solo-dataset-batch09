@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, urlparse
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import Connection, Engine, create_engine, event, inspect
+from sqlalchemy.engine import NestedTransaction
 from sqlalchemy.engine.reflection import Inspector
 from sqlalchemy.schema import MetaData
 from sqlalchemy.sql import text
@@ -134,9 +135,16 @@ class Database:
                 conn.close()
 
     def _flush_tables(self) -> None:
-        """Clear the table metadata after transaction rollbacks."""
+        """Clear the table metadata after transaction rollbacks.
+
+        Rolling back (to) a savepoint can also undo schema changes, so
+        the cached table definitions, column maps and index information
+        are dropped and will be reflected from the database on next use.
+        """
         for table in self._tables.values():
             table._table = None
+            table._columns = None
+            table._indexes = []
 
     def _auto_commit(self) -> None:
         """Commit pending changes when not in an explicit transaction.
@@ -168,10 +176,17 @@ class Database:
         """Commit the current transaction.
 
         Make all statements executed since the transaction was begun permanent.
+        If the current layer is a savepoint created via
+        :py:meth:`transaction(savepoint=True) <dataset.Database.transaction>`,
+        only that layer is confirmed; the outer transaction stays open.
         """
         if hasattr(self.local, "tx") and self.local.tx:
             tx = self.local.tx.pop()
-            if not self.local.tx:
+            if isinstance(tx, NestedTransaction):
+                # Savepoint layer: releasing it confirms this layer only.
+                # The outer transaction and its connection stay active.
+                tx.commit()
+            elif not self.local.tx:
                 if tx is not True:
                     tx.commit()
                 else:
@@ -182,16 +197,86 @@ class Database:
         """Roll back the current transaction.
 
         Discard all statements executed since the transaction was begun.
+        If the current layer is a savepoint created via
+        :py:meth:`transaction(savepoint=True) <dataset.Database.transaction>`,
+        only that layer is discarded; the outer transaction stays open and
+        can continue to write and eventually commit.
         """
         if hasattr(self.local, "tx") and self.local.tx:
             tx = self.local.tx.pop()
-            if not self.local.tx:
+            if isinstance(tx, NestedTransaction):
+                # Savepoint layer: roll back this layer only. The outer
+                # transaction and its connection stay active.
+                tx.rollback()
+            elif not self.local.tx:
                 if tx is not True:
                     tx.rollback()
                 else:
                     self.executable.rollback()
                 self._release_connection()
             self._flush_tables()
+
+    def _ensure_driver_transaction(self) -> None:
+        """Make sure the DBAPI connection has really begun a transaction.
+
+        SQLAlchemy's SQLite dialect defers emitting ``BEGIN`` until the
+        first data-modifying statement. A ``SAVEPOINT`` created before
+        that would start its own transaction, and releasing it would
+        commit that transaction early, so the outer transaction could no
+        longer roll back changes confirmed by the inner layer. Force
+        ``BEGIN`` first so savepoints stay nested inside the outer
+        transaction.
+        """
+        if not self.is_sqlite:
+            return
+        raw = self.executable.connection.driver_connection
+        if raw is None or raw.in_transaction:
+            return
+        self.executable.exec_driver_sql("BEGIN")
+
+    def _begin_savepoint(self) -> None:
+        """Begin an independent inner transaction layer using a savepoint.
+
+        Must be called while an explicit transaction is active (see
+        :py:meth:`in_transaction <dataset.Database.in_transaction>`).
+        """
+        if not hasattr(self.local, "tx"):
+            self.local.tx = []
+        self._ensure_driver_transaction()
+        self.local.tx.append(self.executable.begin_nested())
+
+    def transaction(self, savepoint: bool = False) -> "Transaction":
+        """Return a context manager for a transaction block.
+
+        Without arguments, this behaves exactly like ``with db:``: the
+        block is committed when it ends normally and rolled back when it
+        raises, and nested blocks only track the nesting depth.
+
+        With ``savepoint=True`` and an explicit transaction already
+        active, the block becomes an independent inner transaction: when
+        it raises, only the changes made inside the block are discarded,
+        and the outer transaction can catch the exception, keep writing
+        and still commit. When the block ends normally, its changes are
+        confirmed only for this layer — a later rollback of the outer
+        transaction still discards them. If no transaction is active,
+        the block is a regular transaction and nothing is committed
+        before it ends normally.
+        ::
+
+            with db:  # outer transaction
+                for order in orders:
+                    try:
+                        with db.transaction(savepoint=True):
+                            db['orders'].insert(order)
+                            validate(order)
+                    except ValueError:
+                        # only this order is discarded, continue the batch
+                        continue
+
+        Transaction state is tracked per thread; exiting an inner block
+        never releases the connection used by the outer transaction.
+        """
+        return Transaction(self, savepoint=savepoint)
 
     def __enter__(self) -> "Database":
         """Start a transaction."""
@@ -380,3 +465,42 @@ class Database:
     def __repr__(self) -> str:
         """Text representation contains the URL."""
         return f"<Database({safe_url(self.url)})>"
+
+
+class Transaction:
+    """Context manager for a transaction block on a database.
+
+    Instances are returned by
+    :py:meth:`Database.transaction <dataset.Database.transaction>` and
+    should not be constructed directly. Entering the context begins a
+    transaction layer (a savepoint when requested inside an active
+    transaction), leaving it commits or rolls back that layer.
+    """
+
+    def __init__(self, db: Database, savepoint: bool = False) -> None:
+        """Configure the transaction layer for the given database."""
+        self.db = db
+        self.savepoint = savepoint
+
+    def __enter__(self) -> Database:
+        """Begin the transaction layer and return the database."""
+        if self.savepoint and self.db.in_transaction:
+            self.db._begin_savepoint()
+        else:
+            # No explicit transaction is active: behave like a regular
+            # transaction, or like ``with db:`` when savepoints are off.
+            self.db.begin()
+        return self.db
+
+    def __exit__(
+        self, error_type: object, error_value: object, traceback: object
+    ) -> None:
+        """End the transaction layer by committing or rolling back."""
+        if error_type is None:
+            try:
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+        else:
+            self.db.rollback()
